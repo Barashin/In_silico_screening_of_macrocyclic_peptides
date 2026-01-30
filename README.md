@@ -408,6 +408,157 @@ In_silico_RaPID/
         └── optimization_progress_*.png
 ```
 
+---
+
+## コアモジュール詳細 (Research_Linux/Research/*.py)
+
+3つのPythonモジュールが連携して動作します。
+
+### モジュール依存関係
+
+```
+active_learning_from_lead.py  (エントリーポイント)
+        │
+        ▼
+active_learning_gnn.py  (ALパイプライン + GNNモデル)
+        │
+        ├──▶ transformer_models.py  (配列ベースモデル)
+        │
+        └──▶ adcp_interface.py      (ドッキング実行)
+```
+
+### 1. adcp_interface.py - ADCPドッキングインターフェース
+
+AutoDock CrankPep (ADCP) のPythonラッパー。
+
+**主要クラス:**
+
+| クラス | 説明 |
+|--------|------|
+| `DockingResult` | ドッキング結果を格納するデータクラス |
+| `ADCPRunner` | ドッキング実行を管理 |
+| `ADCPActiveLearningIntegration` | ALパイプラインとADCPを統合 |
+
+**ADCPRunner の主要メソッド:**
+```python
+runner = ADCPRunner(receptor_file="1O6K.trg", work_dir="result/")
+
+# 単一配列のドッキング
+result = runner.run_docking("HTIHSWQMHFKIN")
+print(result.affinity)  # -34.90 kcal/mol
+
+# バッチドッキング
+results = runner.batch_docking(["HTIHSWQMHFKIN", "ACDEFGHIKLMN"])
+```
+
+**内部処理:**
+1. ADCPコマンドを構築 (`_build_adcp_command`)
+2. subprocessでADCP実行
+3. .dlgファイルをパース (`_parse_dlg_file`)
+4. `DockingResult`オブジェクトを返却
+
+### 2. transformer_models.py - 配列エンコーダモデル
+
+アミノ酸配列を埋め込みベクトルに変換するモデル群。
+
+**主要クラス:**
+
+| クラス | 入力 | 出力 | 説明 |
+|--------|------|------|------|
+| `SequenceTransformerEncoder` | 配列 | 埋め込み | BERT風Transformer + 周期的位置エンコーディング |
+| `GraphTransformerEncoder` | グラフ | 埋め込み | グラフ構造にTransformerを適用 |
+| `CNN1DEncoder` | 配列 | 埋め込み | マルチスケール1D畳み込み (kernel: 3,5,7) |
+| `CatBoostSurrogate` | 配列 | 予測値+不確実性 | 勾配ブースティング + Virtual Ensembles |
+
+**補助クラス/関数:**
+- `CyclicPositionalEncoding`: 環状ペプチド用の周期的位置エンコーディング
+- `AA_VOCAB`: アミノ酸→トークンID辞書
+- `AA_PROPERTIES`: アミノ酸の物理化学的特性（疎水性、分子量、電荷、極性、芳香族性）
+- `AA_SECONDARY_STRUCTURE`: 二次構造傾向パラメータ（α-helix, β-sheet, Turn）
+
+**使用例:**
+```python
+from transformer_models import SequenceTransformerEncoder, CatBoostSurrogate
+
+# Transformerエンコーダ
+encoder = SequenceTransformerEncoder(d_model=128, out_channels=64)
+embeddings = encoder(["HTIHSWQMHFKIN", "ACDEFGHIKLMN"])  # [2, 64]
+
+# CatBoostサロゲート
+catboost = CatBoostSurrogate()
+catboost.fit(sequences, y_values)
+mu, std = catboost.predict(new_sequences)  # 予測値と不確実性
+```
+
+### 3. active_learning_gnn.py - メインパイプライン
+
+Active Learningのコアロジックを実装。
+
+**主要クラス:**
+
+| クラス | 説明 |
+|--------|------|
+| `Config` | パイプライン設定（パス、ハイパーパラメータ等） |
+| `CustomGNN` | スクラッチ実装のGNN (GIN/GCN/GAT/GraphSAGE/MPNN) |
+| `GPModel` | Gaussian Processモデル (GPyTorch) |
+| `SurrogateModel` | GNN/Transformer + GP サロゲートモデル |
+| `ALState` | Active Learning状態管理 |
+| `ActiveLearningPipeline` | メインパイプライン |
+
+**GNNレイヤー（スクラッチ実装）:**
+- `GINConvLayer`: Graph Isomorphism Network
+- `GraphConvLayer`: Graph Convolutional Network
+- `GATConvLayer`: Graph Attention Network
+- `GraphSAGEConvLayer`: GraphSAGE
+- `MPNNConvLayer`: Message Passing Neural Network
+
+**処理フロー:**
+```
+1. sequence_to_graph()
+   └── RDKitでアミノ酸配列を分子グラフに変換
+   └── 環状化処理（N末端-C末端結合）
+   └── ノード特徴量: [原子番号, 次数, 電荷, 混成, 芳香族性, ラジカル電子]
+
+2. CustomGNN.forward()
+   └── グラフ畳み込み層 × num_layers
+   └── グローバル平均プーリング
+   └── 出力: [batch_size, out_channels]
+
+3. GPModel
+   └── RBFカーネル + ARD
+   └── 予測: 平均μ + 標準偏差σ
+
+4. 獲得関数
+   └── expected_improvement(μ, σ, best_y)
+   └── upper_confidence_bound(μ, σ, β)
+   └── probability_of_improvement(μ, σ, best_y)
+
+5. ActiveLearningPipeline.run_iteration()
+   └── サロゲートモデル学習
+   └── 候補選択（獲得関数）
+   └── ドッキング実行
+   └── モデル更新
+```
+
+**使用例:**
+```python
+from active_learning_gnn import Config, ActiveLearningPipeline
+
+config = Config(
+    n_iterations=10,
+    batch_size=5,
+    acquisition="EI"
+)
+
+pipeline = ActiveLearningPipeline(config)
+history = pipeline.run()
+
+# 上位候補取得
+top_candidates = pipeline.get_top(10)
+```
+
+---
+
 ### 結果ディレクトリの使い分け
 | ディレクトリ | 内容 | ドッキング設定 |
 |-------------|------|---------------|
@@ -475,4 +626,4 @@ ls -lt Research_Linux/Research/al_output/ | head -10
 
 ---
 
-**更新日**: 2026-01-30 (v4.0 - 高精度ドッキング設定・自動データ収集機能追加)
+**更新日**: 2026-01-31 (v4.1 - コアモジュール詳細ドキュメント追加)
