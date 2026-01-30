@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Results and output (large files)
+Research_Linux/Research/result/
+Research_Linux/Research/result_active_learning/
+Research_Linux/Research/al_output/
+*.dlg
+*.pdb
+*.pdbqt
+*.trg
+
+# Input files (large)
+Research_Linux/Research/Input/
+Research_Linux/Research/docking_setup/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files (except test_environment.py)
+test_real_*.py
+test_al_*.py
+test_workflow_*.py
+*_test.py
+
+# Temporary files
+*.tmp
+*.bak
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Archives and docs (optional)
+docs/archive/
+
+# Environment
+.env
+*.env
+
+# Large model files
+*.pt
+*.pth
+*.ckpt
+
+# CatBoost
+catboost_info/
+
+# Claude Code
+.claude/
+
+# Misc scripts (not core)
+run_full_workflow.py
+
+# Windows Zone Identifier files
+*:Zone.Identifier
+
+# ZIP archives
+*.zip
+
+# Jupyter notebooks
+*.ipynb
+
+# Other scripts (not core)
+Research_Linux/Research/active_learning_pipeline.py
+Research_Linux/Research/setup_adcp_docking.py
+Research_Linux/Research/test_*.py
