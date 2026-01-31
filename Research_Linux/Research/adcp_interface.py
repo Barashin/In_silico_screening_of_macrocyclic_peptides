@@ -2,21 +2,46 @@
 AutoDock CrankPep Interface
 ============================
 
-AutoDock CrankPepのドッキングシミュレーションを実行するためのインターフェース
+【概要】
+AutoDock CrankPep (ADCP) のドッキングシミュレーションを実行するためのインターフェース
+
+【AutoDock CrankPepとは？】
+環状ペプチド（輪っか状のペプチド）専用のドッキングツールです。
+ペプチドがタンパク質（受容体）にどのように結合するかをシミュレーションし、
+結合力（affinity、単位: kcal/mol）を予測します。
+
+【ドッキングの基本】
+1. 受容体（Target）: 薬が結合する標的タンパク質
+2. リガンド（Ligand）: 結合する分子（ここではペプチド）
+3. ドッキング: リガンドを受容体の結合部位に配置し、最適な結合ポーズを探索
+
+【ADCPの特徴】
+- 環状ペプチド専用に最適化（-cyc オプション）
+- モンテカルロ法による柔軟なポーズ探索
+- OpenMMによる精密なエネルギー計算（リスコアリング）
+
+【出力ファイル】
+- *_summary.dlg: ドッキング結果のサマリー（affinityはここから読み取る）
+- *_out.pdb: 最良ポーズの3D構造
+
+【このファイルの役割】
+ADCPコマンドをPythonから実行し、結果を解析するためのラッパーです。
+Active Learningパイプラインから呼び出されます。
 
 Usage:
-    # Google Colab/Linux環境での使用
+    # 基本的な使い方
     from adcp_interface import ADCPRunner
 
     runner = ADCPRunner(
-        receptor_file="/path/to/receptor.trg",
-        work_dir="/path/to/work_dir"
+        receptor_file="/path/to/receptor.trg",  # 受容体ファイル
+        work_dir="/path/to/work_dir"  # 結果の保存先
     )
 
     # 単一配列のドッキング
     result = runner.run_docking("ACDEFGHIKLMN")
+    print(f"Affinity: {result.affinity} kcal/mol")
 
-    # バッチドッキング
+    # バッチドッキング（複数配列を一括処理）
     results = runner.batch_docking(["ACDEFGHIKLMN", "MLKINGHFEDCA"])
 """
 
@@ -35,20 +60,56 @@ except ImportError:
 
 @dataclass
 class DockingResult:
-    """ドッキング結果を格納するデータクラス"""
+    """
+    ドッキング結果を格納するデータクラス
+
+    【各フィールドの説明】
+    - sequence: ドッキングしたペプチド配列
+    - affinity: 結合力（kcal/mol）。負の値が大きいほど強い結合
+               例: -10 kcal/mol は -5 kcal/mol より強い
+    - best_energy: モンテカルロ探索で見つかった最良エネルギー
+    - n_clusters: 似たポーズをグループ化したクラスター数
+               クラスターが多い = 複数の結合モードがある
+    - status: ドッキングの成否
+               "success": 正常終了
+               "failed": ADCPがエラー終了
+               "timeout": 時間切れ
+               "error": その他のエラー
+    """
     sequence: str
-    affinity: float  # Best affinity (kcal/mol)
-    best_energy: float  # Best energy from MC search
-    n_clusters: int  # Number of clusters
-    status: str  # success, failed, error
-    error_message: Optional[str] = None
-    output_dir: Optional[str] = None
-    pdb_file: Optional[str] = None
-    dlg_file: Optional[str] = None
+    affinity: float  # Best affinity (kcal/mol) - 結合力。負の値が大きいほど強い
+    best_energy: float  # Best energy from MC search - モンテカルロ探索の最良エネルギー
+    n_clusters: int  # Number of clusters - クラスター数（似たポーズのグループ数）
+    status: str  # success, failed, timeout, error
+    error_message: Optional[str] = None  # エラー時のメッセージ
+    output_dir: Optional[str] = None  # 出力ディレクトリ
+    pdb_file: Optional[str] = None  # 最良ポーズの3D構造ファイル
+    dlg_file: Optional[str] = None  # ドッキングログファイル
 
 
 class ADCPRunner:
-    """AutoDock CrankPepのランナークラス"""
+    """
+    AutoDock CrankPepのランナークラス
+
+    【このクラスの役割】
+    ADCPコマンドを構築・実行し、結果を解析します。
+    1. ペプチド配列を受け取る
+    2. ADCPコマンドを構築
+    3. サブプロセスで実行
+    4. 結果ファイル（.dlg）からaffinityを抽出
+
+    【ドッキングの流れ】
+    1. 受容体（.trg）とペプチド配列を入力
+    2. ADCPがモンテカルロ法で結合ポーズを探索
+    3. 複数回（n_runs）探索して最良のポーズを選択
+    4. OpenMMで精密化（オプション）
+    5. 結果を.dlgファイルに出力
+
+    【計算時間の目安】
+    - Quick (n_runs=1, n_evals=5000): 約30秒〜1分
+    - Standard (n_runs=5, n_evals=100000): 約5〜10分
+    - Production (n_runs=10, n_evals=500000): 約30分〜1時間
+    """
 
     def __init__(
         self,
@@ -62,22 +123,30 @@ class ADCPRunner:
         omm_max_itr: int = 5
     ):
         """
+        ADCPランナーを初期化
+
         Parameters
         ----------
         receptor_file : str
             受容体の.trgファイルパス
+            ※.trgファイルはagfrコマンドで事前に作成する必要があります
+            例: agfr -r receptor.pdbqt -l ligand.pdbqt -asv 1.1 -o target
         work_dir : str
-            作業ディレクトリ
+            作業ディレクトリ（結果ファイルの保存先）
         adcp_path : str, optional
-            ADCPの実行ファイルパス（Noneの場合は環境から自動検出）
+            ADCPの実行ファイルパス
+            Noneの場合、環境変数やよくあるパスから自動検出
         n_runs : int
-            MCサーチの実行回数（デフォルト: 5）
+            モンテカルロ探索の実行回数（デフォルト: 5）
+            多いほど精度が上がるが時間もかかる
         n_evals : int
-            各MCサーチの評価回数（デフォルト: 100000）
+            各探索での評価回数（デフォルト: 100000）
+            多いほど広く探索するが時間もかかる
         n_cores : int
             使用するCPUコア数（デフォルト: 2）
         omm_minimize : bool
             OpenMMによるエネルギー最小化を行うか（デフォルト: True）
+            より精密な結合エネルギーを計算できるが時間がかかる
         omm_max_itr : int
             OpenMMの最大イテレーション数（デフォルト: 5）
         """
@@ -217,22 +286,34 @@ class ADCPRunner:
             )
 
     def _build_adcp_command(self, sequence: str, job_name: str, output_dir: str) -> str:
-        """ADCPコマンドを構築"""
+        """
+        ADCPコマンドを構築
+
+        【ADCPの主要オプション】
+        -O: 既存ファイルを上書き
+        -T: ターゲット（受容体）ファイル
+        -s: ペプチド配列（アミノ酸1文字表記）
+        -o: 出力ファイルのプレフィックス
+        -N: モンテカルロ探索の実行回数
+        -n: 各探索での評価ステップ数
+        -cyc: 環状ペプチドとして処理（重要！）
+        -w: 作業ディレクトリ
+        -e: OpenMMによるエネルギー最小化設定
+        """
         cmd_parts = [
             self.adcp_path,
-            "-O",  # Overwrite existing files
-            f"-T {self.receptor_file}",  # Target file (uppercase T)
-            f'-s "{sequence}"',  # Sequence
-            f"-o result_{job_name}",  # Output prefix
-            f"-N {self.n_runs}",  # Number of runs
-            f"-n {self.n_evals}",  # Number of evaluations
-            "-cyc",  # Cyclic peptide (not -c)
-            f"-w {output_dir}"  # Working directory (REQUIRED!)
+            "-O",  # Overwrite: 既存ファイルを上書き
+            f"-T {self.receptor_file}",  # Target: 受容体ファイル（.trg）
+            f'-s "{sequence}"',  # Sequence: ペプチド配列
+            f"-o result_{job_name}",  # Output: 出力ファイル名のプレフィックス
+            f"-N {self.n_runs}",  # Number of runs: MC探索の実行回数
+            f"-n {self.n_evals}",  # Number of evaluations: 各探索の評価回数
+            "-cyc",  # Cyclic: 環状ペプチドモード（N末とC末を結合）
+            f"-w {output_dir}"  # Working directory: 結果の保存先
         ]
 
-        # Note: -j option may not be available in all ADCP versions
-        # Using default parallelization instead
-
+        # OpenMMによるエネルギー最小化（より精密な計算）
+        # in-vacuo: 真空中での計算、数字は最大イテレーション数
         if self.omm_minimize:
             cmd_parts.append(f"-e in-vacuo,{self.omm_max_itr}")
 
@@ -439,11 +520,28 @@ class ADCPActiveLearningIntegration:
 
 
 # ============================================================================
-# Google Colab Helper Functions
+# Google Colab Helper Functions（Google Colab用ヘルパー関数）
 # ============================================================================
+# Google Colabでは、ADCPがデフォルトでインストールされていないため、
+# micromambaを使ってインストールする必要があります。
+#
+# 【Colabでの使用手順】
+# 1. setup_adcp_colab() のスクリプトを実行してADCPをインストール
+# 2. prepare_receptor_colab() で受容体ファイルを準備
+# 3. run_adcp_colab() または batch_docking_colab() でドッキング実行
 
 def setup_adcp_colab():
-    """Google ColabでADCPをセットアップするためのヘルパー関数"""
+    """
+    Google ColabでADCPをセットアップするためのヘルパー関数
+
+    【この関数の役割】
+    Colabにmicromambaをインストールし、adcpsuiteパッケージをセットアップする
+    シェルスクリプトを生成します。
+
+    【使い方】
+    script = setup_adcp_colab()
+    !bash -c "$script"  # Colabで実行
+    """
     setup_script = """
 #!/bin/bash
 # Install micromamba

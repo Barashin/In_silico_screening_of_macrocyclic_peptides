@@ -24,14 +24,14 @@ Lead sequence: htihswqmhfkin
 Peptide length: 13
 
 [Step 1] Scanning existing results...
-  Scanning: /home/shizuku/In_silico_RaPID/Research_Linux/Research/result
+  Scanning: Research_Linux/result
     Found: 104 results
-  Scanning: /home/shizuku/In_silico_RaPID/Research_Linux/Research/result_active_learning
+  Scanning: Research_Linux/result_active_learning
     Found: 36 results
 
   [Combined Statistics]
     Total results: 140
-    Outliers (>= 100.0 kcal/mol): 116
+    Outliers (>= 100 or <= -100 kcal/mol): 116
     Usable for training: 24
     Good results (affinity < 0): 18
     Best: htihswqmhfkin (-34.90 kcal/mol)
@@ -41,7 +41,7 @@ Peptide length: 13
 
 [Step 2] Data Collection Strategy
 
-  Target: 50 usable samples (affinity < 100.0 kcal/mol)
+  Target: 50 usable samples (-100 < affinity < 100 kcal/mol)
   Current: 24 usable samples
   Status: Need ~156 more docking runs (estimated outlier rate: 83%)
 
@@ -79,13 +79,71 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --quick --no-confirm
 
 ---
 
+## 必要ファイル・ディレクトリ
+
+### 必須ファイル
+
+パイプライン実行に必要なファイル一覧:
+
+| ファイル | パス | 説明 | サイズ |
+|----------|------|------|--------|
+| **1O6K.trg** | `Research_Linux/docking_setup/` | 受容体ターゲットファイル（**最重要**） | ~28MB |
+| active_learning_gnn.py | `Research_Linux/Research/` | GNN + GPサロゲートモデル | - |
+| transformer_models.py | `Research_Linux/Research/` | 配列エンコーダモデル | - |
+| adcp_interface.py | `Research_Linux/Research/` | ADCPラッパー | - |
+
+### ターゲットファイル作成用（1O6K.trgがない場合）
+
+| ファイル | パス | 説明 |
+|----------|------|------|
+| 1O6K_noligand.pdb | `Research_Linux/Input/` | 受容体PDBファイル |
+| Peptideligand.pdbqt | `Research_Linux/Input/` | リガンドPDBQT（結合部位特定用） |
+
+### ディレクトリ構造
+
+```
+Research_Linux/
+├── Research/               # Pythonモジュール（必須）
+│   ├── active_learning_gnn.py
+│   ├── transformer_models.py
+│   └── adcp_interface.py
+│
+├── Input/                  # 入力ファイル（.trg作成時に必要）
+│   ├── 1O6K_noligand.pdb
+│   └── Peptideligand.pdbqt
+│
+├── docking_setup/          # ターゲットファイル（必須）
+│   └── 1O6K.trg
+│
+├── result/                 # 初期ドッキング結果（自動作成）
+├── result_active_learning/ # AL結果（自動作成）
+└── al_output/              # 最終出力（自動作成）
+```
+
+### 実行前チェック
+
+```bash
+# 1. ターゲットファイル確認（最重要）
+ls -lh Research_Linux/docking_setup/1O6K.trg
+
+# 2. Pythonモジュール確認
+ls Research_Linux/Research/*.py
+
+# 3. 環境確認
+micromamba activate in_silico_screening
+python -c "import torch; import sklearn; print('OK')"
+```
+
+**1O6K.trg がない場合**は、次のクイックスタートの手順3を参照してください。
+
+---
+
 ## クイックスタート
 
 ### 1. 環境セットアップ（初回のみ）
 
 ```bash
-cd /home/shizuku/In_silico_RaPID
-
+# プロジェクトルートで実行
 # GNN + Active Learning環境
 bash setup_in_silico_screening.sh
 
@@ -104,7 +162,7 @@ python test_environment.py
 
 ```bash
 micromamba activate adcpsuite
-cd Research_Linux/Research/docking_setup
+cd Research_Linux/docking_setup
 
 # 受容体をPDBQTに変換
 agfr -r ../Input/1O6K_noligand.pdb --toPdbqt
@@ -133,9 +191,10 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --no-confirm
 ### 主な機能
 
 - **自動データ収集**: 有効データ（外れ値除く）が目標数に達するまで自動でドッキング
-- **外れ値フィルタリング**: 結合エネルギー ≥ 100 kcal/mol のデータを学習から除外
+- **外れ値フィルタリング**: 結合エネルギー ≥ 100 または ≤ -100 kcal/mol のデータを学習から除外
 - **9種類のサロゲートモデル比較**: GIN, GCN, GAT, GraphSAGE, MPNN, GraphTransformer, SeqTransformer, CNN1D, CatBoost
 - **自動モデル選択**: 80/20分割でテスト性能を評価し、最良モデルを自動選択
+- **リード配列順位表示**: 最終結果でリード配列の順位・改善度を必ず表示
 - **パリティプロット**: 各イテレーションで予測 vs 実測を可視化
 - **進捗プロット**: 最適化の履歴をグラフ化
 
@@ -149,7 +208,7 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --no-confirm
 ┌─────────────────────────────────────────────────┐
 │  2. 既存結果を自動スキャン                      │
 │     result/ と result_active_learning/ を検索   │
-│     外れ値（≥100 kcal/mol）と有効データを分類   │
+│     外れ値（≥100 or ≤-100 kcal/mol）と有効データを分類│
 └─────────────────────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────┐
@@ -175,7 +234,8 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --no-confirm
                       ↓
 ┌─────────────────────────────────────────────────┐
 │  6. 最適化された配列を出力 → al_output/         │
-│     Top 10候補とリードとの比較                  │
+│     Top 10候補 + リード配列の順位表示           │
+│     リードとの改善度比較                        │
 │     最終パリティプロット + 進捗プロット作成     │
 └─────────────────────────────────────────────────┘
 ```
@@ -215,11 +275,61 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --quick --no-confirm
 ```
 
 ### 出力ファイル
-- `results_from_lead_YYYYMMDD_HHMMSS.csv`: 全結果（ランク順）
-- `final_results_YYYYMMDD_HHMMSS.json`: サマリー（リードとの比較含む）
-- `checkpoint_iterN.json`: 各イテレーションのチェックポイント
-- `parity_plots/`: イテレーション毎のパリティプロット
-- `optimization_progress_*.png`: 最適化進捗プロット
+
+| ファイル | 説明 |
+|----------|------|
+| `results_from_lead_*.csv` | 全結果（ランク順、リード配列マーク付き） |
+| `final_results_*.json` | サマリー（リード順位・改善度含む） |
+| `checkpoint_iterN.json` | 各イテレーションのチェックポイント |
+| `parity_plots/` | イテレーション毎のパリティプロット |
+| `optimization_progress_*.png` | 最適化進捗プロット |
+
+### 出力フォーマット
+
+**CSV形式:**
+```csv
+rank,sequence,affinity,is_lead
+1,optimized_seq,-38.50,FALSE
+2,another_seq,-36.20,FALSE
+...
+45,htihswqmhfkin,-22.30,TRUE
+```
+
+**JSON形式:**
+```json
+{
+  "lead_sequence": "htihswqmhfkin",
+  "lead_rank": 45,
+  "lead_affinity": -22.30,
+  "best_sequence": "optimized_seq",
+  "best_affinity": -38.50,
+  "improvement": 16.20,
+  "total_evaluated": 150,
+  ...
+}
+```
+
+**コンソール出力例:**
+```
+[Top 10 Sequences]
+------------------------------------------------------------
+Rank   Sequence                  Affinity (kcal/mol)  Note
+------------------------------------------------------------
+1      optimized_seq             -38.50
+2      another_seq               -36.20
+...
+------------------------------------------------------------
+
+[Lead Sequence Rank]
+  htihswqmhfkin: Rank 45 / 150 (-22.30 kcal/mol)
+
+[Improvement Summary]
+  Lead sequence (htihswqmhfkin):
+    Affinity: -22.30 kcal/mol
+    Rank: 45 / 150
+  Best sequence (optimized_seq): -38.50 kcal/mol
+  Improvement: 16.20 kcal/mol ✓
+```
 
 ---
 
@@ -301,7 +411,7 @@ python active_learning_from_lead.py --lead "htihswqmhfkin" --auto-select-model
 
 ### 外れ値フィルタリング
 
-結合エネルギーが100 kcal/mol以上のデータは外れ値として学習データから自動的に除外されます。これにより:
+結合エネルギーが100 kcal/mol以上、または-100 kcal/mol以下のデータは外れ値として学習データから自動的に除外されます。これにより:
 - ドッキング失敗による異常値の影響を排除
 - より安定したモデル学習を実現
 - 予測精度の向上
@@ -380,20 +490,24 @@ PI(x) = Φ((f_best - μ(x)) / σ(x))
 ## プロジェクト構造
 
 ```
-In_silico_RaPID/
+In_silico_screening_of_macrocyclic_peptides/
 ├── active_learning_from_lead.py    # メインスクリプト（推奨）
-├── active_learning_docking.py      # 従来スクリプト
 ├── setup_in_silico_screening.sh    # GNN環境セットアップ
 ├── adcpsuite_micromamba.sh         # ADCP環境セットアップ
 ├── test_environment.py             # 環境テスト
 │
-└── Research_Linux/Research/
-    ├── active_learning_gnn.py      # GNN + GPパイプライン
-    ├── transformer_models.py       # Transformer/CNN/CatBoostモデル
-    ├── adcp_interface.py           # ADCPインターフェース
+└── Research_Linux/
+    ├── Research/                   # Pythonモジュール
+    │   ├── active_learning_gnn.py      # GNN + GPパイプライン
+    │   ├── transformer_models.py       # Transformer/CNN/CatBoostモデル
+    │   └── adcp_interface.py           # ADCPインターフェース
     │
     ├── Input/                      # 入力ファイル
-    ├── docking_setup/              # ターゲットファイル（1O6K.trg）
+    │   ├── 1O6K_noligand.pdb
+    │   └── Peptideligand.pdbqt
+    │
+    ├── docking_setup/              # ターゲットファイル
+    │   └── 1O6K.trg
     │
     ├── result/                     # 初期ドッキング結果
     │   └── {sequence}/             # 各配列のドッキング結果
@@ -410,7 +524,7 @@ In_silico_RaPID/
 
 ---
 
-## コアモジュール詳細 (Research_Linux/Research/*.py)
+## コアモジュール詳細 (Research_Linux/Research/)
 
 3つのPythonモジュールが連携して動作します。
 
@@ -562,9 +676,9 @@ top_candidates = pipeline.get_top(10)
 ### 結果ディレクトリの使い分け
 | ディレクトリ | 内容 | ドッキング設定 |
 |-------------|------|---------------|
-| `result/` | 初期データ収集 | N=5, n=100000, implicit |
-| `result_active_learning/` | AL結果 | N=5, n=100000, implicit（同じ設定） |
-| `al_output/` | 最終結果 | - |
+| `Research_Linux/result/` | 初期データ収集 | N=5, n=100000, implicit |
+| `Research_Linux/result_active_learning/` | AL結果 | N=5, n=100000, implicit（同じ設定） |
+| `Research_Linux/al_output/` | 最終結果 | - |
 
 ---
 
@@ -584,7 +698,7 @@ python test_environment.py
 
 ### ターゲットファイルが見つからない
 ```bash
-cd Research_Linux/Research/docking_setup
+cd Research_Linux/docking_setup
 micromamba activate adcpsuite
 agfr -r ../Input/1O6K_noligand.pdb --toPdbqt
 agfr -r 1O6K_noligand_rec.pdbqt -l ../Input/Peptideligand.pdbqt -asv 1.1 -o 1O6K
@@ -605,14 +719,14 @@ agfr -r 1O6K_noligand_rec.pdbqt -l ../Input/Peptideligand.pdbqt -asv 1.1 -o 1O6K
 
 ```bash
 # ドッキング済み配列数
-ls Research_Linux/Research/result/ | wc -l
-ls Research_Linux/Research/result_active_learning/ | wc -l
+ls Research_Linux/result/ | wc -l
+ls Research_Linux/result_active_learning/ | wc -l
 
 # 現在のドッキング状況
 ps aux | grep adcp | grep -v grep
 
 # 最新の結果確認
-ls -lt Research_Linux/Research/al_output/ | head -10
+ls -lt Research_Linux/al_output/ | head -10
 ```
 
 ---
@@ -626,4 +740,4 @@ ls -lt Research_Linux/Research/al_output/ | head -10
 
 ---
 
-**更新日**: 2026-01-31 (v4.1 - コアモジュール詳細ドキュメント追加)
+**更新日**: 2026-01-31 (v4.4 - リード配列順位表示機能追加)

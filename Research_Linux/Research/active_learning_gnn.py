@@ -3,15 +3,55 @@
 Active Learning Pipeline with Custom GNN for Cyclic Peptide Screening
 ======================================================================
 
+【概要】
 環状ペプチドのドッキングスコア（AutoDock CrankPep）を最小化するための
 Active Learning / ベイズ最適化パイプライン
 
-GNNはスクラッチから実装（torch_geometric.nn.modelsを使用しない）
+【このファイルの役割】
+- GNN（グラフニューラルネットワーク）モデルの実装
+- サロゲートモデル（代理モデル）の実装
+- 獲得関数（次に試す配列を選ぶ関数）の実装
 
-実行環境: /opt/homebrew/Caskroom/miniforge/base/envs/rapid_screening
+【主要なコンポーネント】
+
+1. GNN層（CustomGNN）
+   ペプチドの分子構造をグラフとして処理し、特徴量を抽出します。
+   5種類のアーキテクチャを実装:
+   - GIN: Graph Isomorphism Network
+   - GCN: Graph Convolutional Network
+   - GAT: Graph Attention Network
+   - GraphSAGE: Sample and Aggregate
+   - MPNN: Message Passing Neural Network
+
+2. サロゲートモデル（SurrogateModel）
+   GNN + ガウス過程（GP）を組み合わせたモデル。
+   - GNN: ペプチドを固定長のベクトルに変換
+   - GP: ベクトルから結合力を予測（不確実性付き）
+
+3. 獲得関数
+   次にどの配列をドッキングすべきかを決める関数:
+   - EI (Expected Improvement): 期待される改善量
+   - UCB (Upper Confidence Bound): 楽観的な予測
+   - PI (Probability of Improvement): 改善する確率
+
+【GNNの仕組み（初心者向け）】
+ペプチドの分子構造を「グラフ」として表現します:
+- ノード（点）: 各原子
+- エッジ（線）: 原子間の結合
+
+GNNは「メッセージパッシング」という仕組みで動作:
+1. 各原子が隣接原子から情報を受け取る（メッセージ）
+2. 受け取った情報を集約して自分の特徴を更新
+3. これを複数回繰り返す
+4. 全原子の情報を集約してペプチド全体の特徴を得る
+
+【使用方法】
+このファイルは直接実行せず、active_learning_from_lead.py から
+インポートして使用します。
 
 Usage:
-    python active_learning_gnn.py
+    # 通常は active_learning_from_lead.py から呼び出される
+    from active_learning_gnn import CustomGNN, SurrogateModel
 """
 
 import os
@@ -53,46 +93,75 @@ from transformer_models import SequenceTransformerEncoder, GraphTransformerEncod
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# Configuration
+# Configuration（設定）
 # ============================================================================
+# パイプライン全体の設定を管理するクラス。
+# デフォルト値を変更することで、実験条件を調整できます。
 
 @dataclass
 class Config:
-    """パイプライン設定"""
+    """
+    パイプライン設定
+
+    【設定のカテゴリ】
+    1. パス: データの入出力先
+    2. GNN設定: ニューラルネットワークの構造
+    3. GP設定: ガウス過程の学習パラメータ
+    4. Active Learning設定: 最適化ループの設定
+    5. ペプチド設定: 対象ペプチドの仕様
+    """
     # パス
     result_dir: str = "/home/shizuku/In_silico_RaPID/Research_Linux/Research/result"
     output_dir: str = "/home/shizuku/In_silico_RaPID/Research_Linux/Research/al_output"
 
     # GNN設定
+    # hidden_dim: 中間層のニューロン数（大きいほど表現力が高いが、過学習のリスクも増加）
+    # output_dim: 出力ベクトルの次元数（GPへの入力）
+    # num_layers: GNNの層数（深いほど遠くの原子の情報を取り込める）
+    # dropout: 過学習を防ぐためにランダムにニューロンを無効化する割合
     gnn_hidden_dim: int = 128
     gnn_output_dim: int = 64
     gnn_num_layers: int = 3
     gnn_dropout: float = 0.2
 
-    # GP設定
+    # GP（ガウス過程）設定
+    # training_iterations: GPの最適化イテレーション数
+    # learning_rate: 学習率（大きいほど学習が速いが不安定になりやすい）
     gp_training_iterations: int = 50
     gp_learning_rate: float = 0.1
 
     # Active Learning設定
+    # n_iterations: 最適化ループの回数
+    # batch_size: 1イテレーションで評価する配列数
+    # acquisition: 獲得関数の種類（EI=期待改善量、UCB=信頼上限、PI=改善確率）
+    # ucb_beta: UCBの探索-活用バランスパラメータ（大きいほど探索重視）
     n_iterations: int = 20
     batch_size: int = 5
     acquisition: str = "EI"  # EI, UCB, PI
     ucb_beta: float = 2.0
 
     # ペプチド設定
-    peptide_length: int = 13
-    amino_acids: str = "ACDEFGHIKLMNPQRSTVWY"
+    peptide_length: int = 13  # 環状ペプチドの長さ（アミノ酸数）
+    amino_acids: str = "ACDEFGHIKLMNPQRSTVWY"  # 使用可能な20種類のアミノ酸
 
     # その他
-    seed: int = 42
-    device: str = "cpu"
+    seed: int = 42  # 乱数シード（再現性のため）
+    device: str = "cpu"  # 計算デバイス（"cuda"でGPU使用）
 
 
 # ============================================================================
-# Amino Acid Properties (スクラッチ実装用)
+# Amino Acid Properties（アミノ酸の物理化学的特性）
 # ============================================================================
+# 各アミノ酸には固有の物理化学的特性があります。
+# これらの特性は、ペプチドの機能や受容体との相互作用に影響します。
+#
+# 【各特性の意味】
+# - hydrophobicity（疎水性）: 水を嫌う性質。正の値が疎水的、負の値が親水的
+# - charge（電荷）: +1（正電荷）, -1（負電荷）, 0（中性）
+# - polar（極性）: 1（極性あり）, 0（非極性）
+# - aromatic（芳香族）: 1（芳香環あり）, 0（なし）
+# - mass（分子量）: アミノ酸の重さ（単位: Da）
 
-# アミノ酸の物理化学的特性
 AA_PROPERTIES = {
     'A': {'hydrophobicity': 1.8, 'charge': 0, 'polar': 0, 'aromatic': 0, 'mass': 89.1},
     'C': {'hydrophobicity': 2.5, 'charge': 0, 'polar': 0, 'aromatic': 0, 'mass': 121.2},
@@ -121,24 +190,48 @@ AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
 
 
 # ============================================================================
-# Peptide to Graph Conversion (スクラッチ実装)
+# Peptide to Graph Conversion（ペプチドからグラフへの変換）
 # ============================================================================
+# ペプチド配列（文字列）を、GNNで処理可能なグラフデータに変換します。
+#
+# 【変換の流れ】
+# 1. アミノ酸配列（例: "HTIH..."）を受け取る
+# 2. RDKitで分子構造を生成
+# 3. 環状化（N末端とC末端を結合）
+# 4. 各原子の特徴量を計算（ノード特徴）
+# 5. 原子間の結合をエッジとして抽出
+#
+# 【グラフの構造】
+# - ノード: 各原子（C, N, O, H など）
+# - エッジ: 原子間の化学結合
+# - ノード特徴: 原子番号、結合数、電荷、混成軌道、芳香族性など
 
 def sequence_to_graph(sequence: str, cyclic: bool = True) -> Optional[Data]:
     """
     ペプチド配列をグラフデータに変換（RDKitを使用）
 
+    【この関数の役割】
+    文字列のペプチド配列を、GNNが処理できるグラフ形式に変換します。
+    RDKitを使って分子構造を生成し、環状化も行います。
+
+    【環状化とは？】
+    環状ペプチドは、N末端（アミノ基 NH2）とC末端（カルボキシ基 COOH）が
+    結合して環を形成しています。この結合を作成します。
+
     Parameters
     ----------
     sequence : str
         アミノ酸配列（例: "HTIHSWQMHFKIN"）
+        大文字でも小文字でもOK
     cyclic : bool
-        環状ペプチドかどうか
+        環状ペプチドとして処理するか（デフォルト: True）
 
     Returns
     -------
     Data
         torch_geometricのDataオブジェクト
+        - x: ノード特徴量 [num_atoms, 6]
+        - edge_index: エッジインデックス [2, num_edges]
     """
     try:
         seq = sequence.upper().strip()
@@ -245,14 +338,36 @@ def sequence_to_features(sequence: str) -> Optional[torch.Tensor]:
 
 
 # ============================================================================
-# Custom GNN Implementation (スクラッチ)
+# Custom GNN Implementation（GNNのスクラッチ実装）
 # ============================================================================
+# このセクションでは、5種類のGNNレイヤーを一から実装しています。
+# ライブラリ（torch_geometric.nn.models）を使わず、メッセージパッシングの
+# 仕組みを直接実装することで、カスタマイズ性と理解を深めています。
+#
+# 【メッセージパッシングの基本】
+# 各ノード（原子）が隣接ノードから情報を「メッセージ」として受け取り、
+# 自身の特徴を更新します。これを複数回繰り返すことで、
+# 遠くのノードの情報も取り込めます。
+#
+# 【5種類のGNNレイヤー】
+# 1. GCN (GraphConvLayer): 最もシンプル。隣接ノードの平均を取る
+# 2. GIN (GINConvLayer): より表現力が高い。MLPで変換
+# 3. GAT (GATConvLayer): 重要な隣接ノードに注目するアテンション機構
+# 4. GraphSAGE (GraphSAGEConvLayer): 自己と隣接を別々に処理して結合
+# 5. MPNN (MPNNConvLayer): 一般的なメッセージと更新関数
 
 class GraphConvLayer(nn.Module):
     """
-    Graph Convolutional Layer（スクラッチ実装）
+    Graph Convolutional Layer（グラフ畳み込み層）
 
-    メッセージパッシング: h_i' = σ(W * Σ_j h_j / deg(i))
+    【アルゴリズム】
+    h_i' = σ(W * Σ_j h_j / deg(i))
+
+    各ノードは隣接ノードの特徴を次数で割って平均し、
+    線形変換（W）を適用します。
+
+    【直感的な説明】
+    「自分の隣人たちの意見の平均を聞いて、自分の意見を更新する」
     """
 
     def __init__(self, in_channels: int, out_channels: int):
@@ -304,9 +419,21 @@ class GraphConvLayer(nn.Module):
 
 class GINConvLayer(nn.Module):
     """
-    Graph Isomorphism Network Layer（スクラッチ実装）
+    Graph Isomorphism Network Layer（グラフ同型ネットワーク層）
 
+    【アルゴリズム】
     h_i' = MLP((1 + ε) * h_i + Σ_j h_j)
+
+    自分自身の特徴と隣接ノードの特徴の合計を、
+    MLP（多層パーセプトロン）で変換します。
+
+    【GINの特徴】
+    - εパラメータで自己ループの重みを学習
+    - GCNより表現力が高い（グラフの構造をより識別できる）
+    - グラフの同型性テストに相当する識別能力
+
+    【直感的な説明】
+    「自分の意見を少し強調しつつ、隣人全員の意見を足し合わせる」
     """
 
     def __init__(self, in_channels: int, out_channels: int, eps: float = 0.0):
@@ -355,10 +482,22 @@ class GINConvLayer(nn.Module):
 
 class GATConvLayer(nn.Module):
     """
-    Graph Attention Network Layer（スクラッチ実装）
+    Graph Attention Network Layer（グラフアテンション層）
 
+    【アルゴリズム】
     h_i' = σ(Σ_j α_ij * W * h_j)
     α_ij = softmax(LeakyReLU(a^T [Wh_i || Wh_j]))
+
+    隣接ノードからの情報を、「アテンションスコア」で重み付けして集約します。
+    重要な隣接ノードにより多くの注目を払います。
+
+    【GATの特徴】
+    - 各エッジに異なる重み（アテンション）を学習
+    - マルチヘッドアテンション（複数の視点で注目）
+    - ノードの重要度を動的に判断
+
+    【直感的な説明】
+    「重要な隣人の意見をより重視して聞く」
     """
 
     def __init__(self, in_channels: int, out_channels: int, heads: int = 4, dropout: float = 0.1):
@@ -524,7 +663,24 @@ class MPNNConvLayer(nn.Module):
 class CustomGNN(nn.Module):
     """
     カスタムGNNモデル（スクラッチ実装）
-    対応アーキテクチャ: GIN, GCN, GAT, GraphSAGE, MPNN
+
+    【このクラスの役割】
+    複数のGNNレイヤーを積み重ねて、ペプチドのグラフから
+    固定長のベクトル（埋め込み）を生成します。
+
+    【アーキテクチャの選択】
+    conv_typeパラメータで以下から選択可能:
+    - GIN: 最も表現力が高い（デフォルト、推奨）
+    - GCN: シンプルで高速
+    - GAT: アテンション機構付き
+    - GraphSAGE: サンプリングベース
+    - MPNN: 汎用的なメッセージパッシング
+
+    【処理の流れ】
+    1. 入力: ペプチドのグラフ（原子=ノード、結合=エッジ）
+    2. 複数のGNN層で特徴を抽出
+    3. グローバルプーリングで全ノードを集約
+    4. 出力: 固定長のベクトル（GPの入力になる）
     """
 
     # サポートするGNNタイプ
@@ -630,11 +786,34 @@ class CustomGNN(nn.Module):
 
 
 # ============================================================================
-# Gaussian Process Model
+# Gaussian Process Model（ガウス過程モデル）
 # ============================================================================
+# ガウス過程（GP）は、予測値だけでなく「不確実性」も出力できる回帰モデルです。
+# 「この予測がどれくらい確かか」を知ることで、Active Learningで
+# 探索（不確実な領域を調べる）と活用（良さそうな領域を深掘り）のバランスを取れます。
+#
+# 【GPの利点】
+# - 予測値と不確実性（分散）の両方を出力
+# - 少ないデータでも機能する
+# - 過学習しにくい（ベイズ的アプローチ）
+#
+# 【GPの仕組み（簡略版）】
+# 1. 訓練データ点間の「類似度」をカーネル関数で計算
+# 2. 新しい点の予測は、訓練データとの類似度で重み付けした平均
+# 3. 訓練データから遠い点ほど不確実性（分散）が大きくなる
 
 class GPModel(ExactGP):
-    """Gaussian Processモデル"""
+    """
+    Gaussian Processモデル（gpytorch実装）
+
+    【このクラスの役割】
+    GNNで生成した埋め込みベクトルから、ドッキングスコア（affinity）を予測します。
+    予測の平均と分散（不確実性）の両方を出力します。
+
+    【使用するカーネル】
+    - RBFKernel: 最も一般的なカーネル。滑らかな関数を仮定
+    - ARD (Automatic Relevance Determination): 各次元の重要度を自動学習
+    """
 
     def __init__(self, train_x, train_y, likelihood):
         super().__init__(train_x, train_y, likelihood)
@@ -648,19 +827,42 @@ class GPModel(ExactGP):
 
 
 class SurrogateModel:
-    """GNN/Transformer + GP サロゲートモデル"""
+    """
+    GNN/Transformer + GP サロゲートモデル
+
+    【サロゲートモデル（代理モデル）とは？】
+    実際のドッキング計算の代わりに、結合力を高速に予測するモデルです。
+    ドッキング計算は1配列あたり数分かかりますが、サロゲートモデルは数ミリ秒で予測できます。
+
+    【このモデルの構造】
+    1. エンコーダー（GNNまたはTransformer）
+       - ペプチド配列/グラフを固定長のベクトルに変換
+       - 「ペプチドの特徴」を数値で表現
+    2. ガウス過程（GP）
+       - ベクトルからaffinityを予測
+       - 不確実性（どれくらい自信があるか）も出力
+
+    【使い方】
+    1. fit(): 既知のデータで学習
+    2. predict(): 新しい配列のaffinityを予測（平均と標準偏差）
+    """
 
     def __init__(self, encoder: nn.Module, config: Config, encoder_mode: str = "graph"):
         """
+        サロゲートモデルを初期化
+
         Parameters
         ----------
         encoder : nn.Module
-            エンコーダーモデル（CustomGNN, SequenceTransformerEncoder, or GraphTransformerEncoder）
+            エンコーダーモデル。以下のいずれか:
+            - CustomGNN: グラフ入力（分子構造を直接処理）
+            - SequenceTransformerEncoder: 配列入力（文字列を処理）
+            - GraphTransformerEncoder: グラフ+Transformer
         config : Config
-            設定
+            設定オブジェクト（学習率、イテレーション数など）
         encoder_mode : str
-            "graph": グラフ入力（GNN, GraphTransformer）
-            "sequence": 配列入力（SeqTransformer）
+            "graph": グラフ入力モード（GNN, GraphTransformer用）
+            "sequence": 配列入力モード（SeqTransformer, CNN1D用）
         """
         self.encoder = encoder
         self.gnn = encoder  # 後方互換性のため
@@ -789,26 +991,97 @@ class SurrogateModel:
 
 
 # ============================================================================
-# Acquisition Functions
+# Acquisition Functions（獲得関数）
 # ============================================================================
+# 獲得関数は「次にどの候補を評価すべきか」を決めるための関数です。
+# 予測値（mu）と不確実性（std）の両方を考慮して、候補にスコアを付けます。
+#
+# 【Active Learningのジレンマ：探索 vs 活用】
+# - 探索（Exploration）: まだよく分かっていない領域を調べる → 不確実性が高い点を選ぶ
+# - 活用（Exploitation）: 良さそうな領域を深掘りする → 予測値が良い点を選ぶ
+#
+# 獲得関数はこのバランスを自動的に取ってくれます。
 
 def expected_improvement(mu: np.ndarray, std: np.ndarray, best_y: float) -> np.ndarray:
-    """Expected Improvement（最小化）"""
+    """
+    Expected Improvement（期待改善量）
+
+    【この関数の意味】
+    「この候補を評価したとき、現在のベストをどれくらい改善できそうか」
+    の期待値を計算します。
+
+    【計算式】
+    EI = (best_y - mu) * Φ(z) + std * φ(z)
+    z = (best_y - mu) / std
+    Φ: 標準正規分布の累積分布関数
+    φ: 標準正規分布の確率密度関数
+
+    【特徴】
+    - 最も広く使われる獲得関数
+    - 探索と活用のバランスが良い
+    - 予測値が良く、かつ不確実性も高い点を好む
+
+    Parameters
+    ----------
+    mu : np.ndarray
+        予測平均（各候補のaffinity予測値）
+    std : np.ndarray
+        予測標準偏差（各候補の不確実性）
+    best_y : float
+        現在のベストaffinity（最小値）
+
+    Returns
+    -------
+    np.ndarray
+        各候補のEIスコア（大きいほど有望）
+    """
     with np.errstate(divide='ignore'):
-        imp = best_y - mu
-        z = imp / (std + 1e-9)
+        imp = best_y - mu  # 改善量（最小化なので best - mu）
+        z = imp / (std + 1e-9)  # 標準化
         ei = imp * norm.cdf(z) + std * norm.pdf(z)
-        ei[std < 1e-9] = 0
+        ei[std < 1e-9] = 0  # 不確実性がない点はスキップ
     return ei
 
 
 def upper_confidence_bound(mu: np.ndarray, std: np.ndarray, beta: float = 2.0) -> np.ndarray:
-    """UCB（最小化→LCBとして使用）"""
-    return -(mu - beta * std)
+    """
+    Upper Confidence Bound（信頼上限）
+
+    【この関数の意味】
+    「この候補は、楽観的に見てどれくらい良い可能性があるか」
+    を計算します。
+
+    【計算式】
+    UCB = -(mu - beta * std)  # 最小化問題なので符号反転（LCB）
+
+    【betaパラメータの意味】
+    - beta が大きい: 探索重視（不確実な点を好む）
+    - beta が小さい: 活用重視（予測が良い点を好む）
+    - beta = 2.0 が一般的な値
+
+    【特徴】
+    - シンプルで計算が速い
+    - betaでバランスを明示的に調整可能
+    """
+    return -(mu - beta * std)  # 最小化問題なのでLCBとして使用
 
 
 def probability_of_improvement(mu: np.ndarray, std: np.ndarray, best_y: float) -> np.ndarray:
-    """Probability of Improvement（最小化）"""
+    """
+    Probability of Improvement（改善確率）
+
+    【この関数の意味】
+    「この候補が現在のベストを改善する確率」を計算します。
+
+    【計算式】
+    PI = Φ((best_y - mu) / std)
+    Φ: 標準正規分布の累積分布関数
+
+    【特徴】
+    - 直感的に理解しやすい（「改善する確率」）
+    - 活用寄りの傾向（既に良い領域を集中的に探索）
+    - EIより保守的な選択をする傾向
+    """
     with np.errstate(divide='ignore'):
         z = (best_y - mu) / (std + 1e-9)
         pi = norm.cdf(z)
@@ -895,12 +1168,30 @@ def generate_mutants(base_seq: str, n_mut: int = 2, n_var: int = 10, existing: s
 
 
 # ============================================================================
-# Active Learning Pipeline
+# Active Learning Pipeline（Active Learningパイプライン）
 # ============================================================================
+# このセクションは、Active Learning全体の流れを管理するクラスです。
+# ※ 通常は active_learning_from_lead.py の ActiveLearningFromLead クラスを
+#    使用しますが、このクラスはスタンドアロンでテスト実行できます。
+#
+# 【Active Learningの全体フロー】
+# 1. 初期データを読み込み
+# 2. サロゲートモデルを学習
+# 3. 候補配列を生成
+# 4. 獲得関数で有望な候補を選択
+# 5. 選択した候補を評価（ドッキング）
+# 6. データを更新して2に戻る
+#
+# これを繰り返すことで、少ない評価回数で最適な配列を見つけます。
 
 @dataclass
 class ALState:
-    """Active Learning状態"""
+    """
+    Active Learning状態
+
+    【このクラスの役割】
+    Active Learningの現在の状態（どの配列を評価したか、ベストは何か）を管理します。
+    """
     iteration: int = 0
     sequences: List[str] = field(default_factory=list)
     affinities: List[float] = field(default_factory=list)
@@ -911,7 +1202,26 @@ class ALState:
 
 
 class ActiveLearningPipeline:
-    """Active Learningパイプライン"""
+    """
+    Active Learningパイプライン（スタンドアロン版）
+
+    【このクラスの役割】
+    Active Learning全体の流れを管理します。
+    - 初期化: GNNとサロゲートモデルを作成
+    - データ読み込み: 既存のドッキング結果を読み込み
+    - 候補生成: ランダム配列と変異体を生成
+    - 候補選択: 獲得関数で有望な配列を選択
+    - 更新: 新しい評価結果でモデルを更新
+
+    【使用方法】
+    config = Config(n_iterations=10, batch_size=5)
+    pipeline = ActiveLearningPipeline(config)
+    history = pipeline.run()
+
+    【注意】
+    通常は active_learning_from_lead.py の方を使用してください。
+    こちらはシミュレーション（実際のドッキングなし）でテスト用です。
+    """
 
     def __init__(self, config: Config):
         self.config = config

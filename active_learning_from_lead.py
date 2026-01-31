@@ -1,31 +1,58 @@
 #!/usr/bin/env python3
 """
-Active Learning from Lead Sequence
-===================================
+Active Learning from Lead Sequence - 環状ペプチド最適化パイプライン
+====================================================================
 
-リード配列からランダム変異体を生成し、初期ドッキングを行った後、
-Active Learningで最適化を進める完全自動パイプライン。
+【概要】
+このスクリプトは、リード配列（初期のペプチド配列）から出発して、
+機械学習を使ってより結合力の強いペプチド配列を自動的に探索します。
 
-ワークフロー:
-1. リード配列を入力（PDBから抽出 or 直接指定）
-2. 既存結果を確認（100個以上あれば再利用可能）
-3. 不足分のランダム変異体を生成
-4. 初期ドッキングを実行
-5. モデルを学習
-6. Active Learningで最適化
+【Active Learningとは？】
+- 少ないデータで効率的に最適解を見つける機械学習手法
+- サロゲートモデル（代理モデル）で結合力を予測
+- 獲得関数で「次に試すべき配列」を賢く選択
+- 実際にドッキングして結果を確認 → モデルを更新 → 繰り返し
 
-使用例:
-    # 既存結果を使用（100個以上あれば新規ドッキング不要）
-    python active_learning_from_lead.py --lead "carsrtyriyqrp" --use-existing
+【ワークフロー】
+1. リード配列を入力
+   例: "htihswqmhfkin"（13アミノ酸の環状ペプチド）
 
-    # 既存結果 + 不足分を生成（合計100個まで）
-    python active_learning_from_lead.py --lead "carsrtyriyqrp" --use-existing --init-size 100
+2. 既存のドッキング結果をスキャン
+   過去に計算した結果があれば再利用（時間節約）
 
-    # クイックテスト
-    python active_learning_from_lead.py --lead "carsrtyriyqrp" --quick --no-confirm
+3. 初期データ収集
+   リード配列の変異体を生成 → ドッキング → 学習データを蓄積
+   ※外れ値（-100〜100 kcal/mol外）は除外
 
-    # 本番実行
-    python active_learning_from_lead.py --lead "carsrtyriyqrp" --production
+4. サロゲートモデルの学習
+   9種類のモデルから最適なものを自動選択
+   - グラフベース: GIN, GCN, GAT, GraphSAGE, MPNN, GraphTransformer
+   - 配列ベース: SeqTransformer, CNN1D, CatBoost
+
+5. Active Learning最適化ループ
+   予測 → 候補選択 → ドッキング → 更新 を繰り返す
+
+6. 結果出力
+   最適化された配列のランキング + リード配列との比較
+
+【使用例】
+    # インタラクティブモード（推奨）
+    python active_learning_from_lead.py --lead "htihswqmhfkin"
+
+    # クイックテスト（動作確認用、数分で完了）
+    python active_learning_from_lead.py --lead "htihswqmhfkin" --quick --no-confirm
+
+    # 本番実行（高精度、数時間かかる）
+    python active_learning_from_lead.py --lead "htihswqmhfkin" --production --no-confirm
+
+【必要ファイル】
+    - Research_Linux/docking_setup/1O6K.trg（受容体ターゲットファイル）
+    - Research_Linux/Research/*.py（モデル実装）
+
+【出力ファイル】
+    - al_output/results_from_lead_*.csv: 全配列のランキング
+    - al_output/final_results_*.json: サマリー（リード順位含む）
+    - al_output/parity_plots/: 予測精度の可視化
 """
 
 import os
@@ -40,7 +67,8 @@ from pathlib import Path
 
 # パスの設定
 SCRIPT_DIR = Path(__file__).parent.absolute()
-RESEARCH_DIR = SCRIPT_DIR / "Research_Linux" / "Research"
+RESEARCH_LINUX_DIR = SCRIPT_DIR / "Research_Linux"
+RESEARCH_DIR = RESEARCH_LINUX_DIR / "Research"  # Pythonモジュール用
 sys.path.insert(0, str(RESEARCH_DIR))
 
 import numpy as np
@@ -48,40 +76,81 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
 
+# =============================================================================
+# 定数定義
+# =============================================================================
+
 # 20種類の天然アミノ酸（小文字）
+# タンパク質を構成する標準的なアミノ酸。ペプチド配列はこれらの組み合わせで表現される
+# 例: "htihswqmhfkin" は H(ヒスチジン), T(スレオニン), I(イソロイシン)... の配列
 AMINO_ACIDS = list("acdefghiklmnpqrstvwy")
 
 # 利用可能なモデルタイプ
+# GNN（グラフニューラルネットワーク）系:
+#   - GIN: Graph Isomorphism Network（グラフの構造を識別する能力が高い）
+#   - GCN: Graph Convolutional Network（基本的なグラフ畳み込み）
+#   - GAT: Graph Attention Network（重要なノードに注目する機構付き）
+#   - GraphSAGE: サンプリングベースのGNN（大規模グラフ向け）
+#   - MPNN: Message Passing Neural Network（汎用的なメッセージパッシング）
+#   - GraphTransformer: Transformerアーキテクチャをグラフに適用
+# 配列ベース:
+#   - SeqTransformer: 配列をTransformerで処理
+#   - CNN1D: 1次元畳み込み（配列のローカルパターンを学習）
+#   - CatBoost: 勾配ブースティング（アミノ酸特徴量を直接使用）
 MODEL_TYPES = ["GIN", "GCN", "GAT", "GraphSAGE", "MPNN",
                "SeqTransformer", "GraphTransformer", "CNN1D", "CatBoost"]
 
-# 外れ値の閾値（これ以上のaffinityは学習から除外）
-AFFINITY_OUTLIER_THRESHOLD = 100.0
+# 外れ値の閾値（この範囲外のaffinityは学習から除外）
+# ドッキングスコアが異常に高い/低い値は計算エラーの可能性があるため除外
+# 通常のドッキングスコアは -20 〜 0 kcal/mol 程度
+AFFINITY_OUTLIER_THRESHOLD_HIGH = 100.0   # >= 100 kcal/mol は外れ値（計算エラー）
+AFFINITY_OUTLIER_THRESHOLD_LOW = -100.0   # <= -100 kcal/mol は外れ値（計算エラー）
+AFFINITY_OUTLIER_THRESHOLD = AFFINITY_OUTLIER_THRESHOLD_HIGH  # 後方互換性のため維持
 
 # モデル学習に必要な最小サンプル数（外れ値を除いた数）
+# 機械学習モデルが意味のある予測をするためには、十分なデータが必要
+# 50サンプル未満だと過学習のリスクが高くなる
 MIN_USABLE_SAMPLES = 50
 
 
-def filter_outliers(sequences, affinities, threshold=AFFINITY_OUTLIER_THRESHOLD):
+def filter_outliers(sequences, affinities,
+                    threshold_high=AFFINITY_OUTLIER_THRESHOLD_HIGH,
+                    threshold_low=AFFINITY_OUTLIER_THRESHOLD_LOW):
     """
-    外れ値（高すぎるaffinity）を除外する
+    外れ値（高すぎる/低すぎるaffinity）を除外する
+
+    【なぜ外れ値を除外するのか？】
+    ドッキング計算では、まれに異常な値（計算エラー）が出ることがあります。
+    これらをそのまま学習に使うと、モデルの予測精度が悪化します。
+
+    【処理の流れ】
+    1. すべてのaffinity値をチェック
+    2. 閾値の範囲外（-100以下 or 100以上）のデータを除外
+    3. 有効なデータのみを返す
 
     Parameters
     ----------
     sequences : list
-        配列のリスト
+        ペプチド配列のリスト（例: ["htihswqm...", "acdefghi..."]）
     affinities : np.ndarray
-        Affinity値の配列
-    threshold : float
-        この値以上のaffinityを外れ値として除外
+        各配列に対応するAffinity値（ドッキングスコア、単位: kcal/mol）
+        負の値ほど結合力が強い
+    threshold_high : float
+        上限閾値。この値以上は外れ値として除外（デフォルト: 100）
+    threshold_low : float
+        下限閾値。この値以下は外れ値として除外（デフォルト: -100）
 
     Returns
     -------
-    tuple
-        (filtered_sequences, filtered_affinities, n_removed)
+    tuple (filtered_sequences, filtered_affinities, n_removed)
+        - filtered_sequences: 外れ値を除いた配列リスト
+        - filtered_affinities: 外れ値を除いたaffinity配列
+        - n_removed: 除外されたサンプル数
     """
     affinities = np.array(affinities)
-    mask = affinities < threshold
+    # 範囲内のデータのみ保持: threshold_low < affinity < threshold_high
+    # 例: -100 < affinity < 100 のデータのみ残す
+    mask = (affinities > threshold_low) & (affinities < threshold_high)
     filtered_seqs = [s for s, m in zip(sequences, mask) if m]
     filtered_affs = affinities[mask]
     n_removed = len(sequences) - len(filtered_seqs)
@@ -91,16 +160,31 @@ def filter_outliers(sequences, affinities, threshold=AFFINITY_OUTLIER_THRESHOLD)
 # =============================================================================
 # 既存結果の読み込み
 # =============================================================================
+# ドッキング計算は時間がかかるため、一度計算した結果は再利用します。
+# このセクションでは、過去に計算した結果をファイルから読み込みます。
 
 def scan_existing_results(result_dir: Path) -> dict:
     """
-    既存のドッキング結果をスキャンして読み込む。
+    既存のドッキング結果をスキャンして読み込む
+
+    【この関数の役割】
+    過去に実行したドッキング計算の結果を読み込み、再計算を避けます。
+    1つの配列につき数分〜数十分かかるため、再利用は大幅な時間節約になります。
+
+    【ディレクトリ構造】
+    result_dir/
+    ├── htihswqmhfkin/           # 配列名のディレクトリ
+    │   └── result_htihswqmhfkin_summary.dlg  # ドッキング結果ファイル
+    ├── acdefghiklmn/
+    │   └── result_acdefghiklmn_summary.dlg
+    └── ...
 
     Args:
-        result_dir: 結果ディレクトリ（各サブディレクトリが配列名）
+        result_dir: 結果ディレクトリへのパス
 
     Returns:
         {sequence: affinity} の辞書
+        例: {"htihswqmhfkin": -8.5, "acdefghiklmn": -6.2, ...}
     """
     results = {}
 
@@ -191,13 +275,29 @@ def load_csv_results(result_dir: Path) -> dict:
 # =============================================================================
 # 変異体生成
 # =============================================================================
+# リード配列（最初に与えられた配列）を変異させて、新しい候補配列を生成します。
+#
+# 【変異とは？】
+# 配列中のアミノ酸を別のアミノ酸に置き換えること。
+# 例: "HTIH..." → "ATIH..."（1番目のHをAに変異）
+#
+# 【なぜ変異体を生成するのか？】
+# リード配列に近い配列は、似たような性質（結合力）を持つ可能性が高い。
+# 少しずつ変異させることで、効率的に良い配列を探索できる。
 
 def random_mutate_all_positions(peptide: str) -> str:
     """
-    全位置を元と異なるアミノ酸にランダム変異させる。
+    全位置を元と異なるアミノ酸にランダム変異させる
+
+    【用途】
+    リード配列とは大きく異なる配列を生成したい場合に使用。
+    探索空間の多様性を確保するため。
+
+    【例】
+    入力: "htih" → 出力: "acde"（全位置が変更される）
 
     Args:
-        peptide: 元のペプチド配列
+        peptide: 元のペプチド配列（例: "htihswqmhfkin"）
 
     Returns:
         変異後の配列（全位置が元と異なる）
@@ -360,9 +460,28 @@ def generate_diverse_library(
 # =============================================================================
 # ドッキング実行
 # =============================================================================
+# AutoDock CrankPep (ADCP) を使って、ペプチドと受容体タンパク質の
+# ドッキングシミュレーションを実行します。
+#
+# 【ドッキングとは？】
+# ペプチド（薬の候補）がタンパク質（標的）にどのように結合するかを
+# コンピュータでシミュレーションすること。
+# 結合力（affinity）はkcal/mol単位で表され、負の値が大きいほど強く結合。
+# 例: -10 kcal/mol は -5 kcal/mol より強い結合
 
 class DockingRunner:
-    """ADCPドッキングを実行するクラス"""
+    """
+    ADCPドッキングを実行するクラス
+
+    【このクラスの役割】
+    1. ペプチド配列を受け取る
+    2. ADCPコマンドを構築して実行
+    3. 結果ファイル（.dlg）からaffinityを抽出
+
+    【使用するツール】
+    - AutoDock CrankPep (ADCP): 環状ペプチド専用のドッキングツール
+    - OpenMM: より精密なエネルギー計算（リスコアリング）
+    """
 
     def __init__(
         self,
@@ -525,13 +644,34 @@ class DockingRunner:
 # =============================================================================
 # モデル比較・評価機能
 # =============================================================================
+# 機械学習モデルの性能を評価し、最適なモデルを選択するための機能です。
+#
+# 【評価指標】
+# - R² (決定係数): 1に近いほど予測精度が高い（1.0が完璧）
+# - RMSE (平均二乗誤差の平方根): 小さいほど誤差が少ない
+# - MAE (平均絶対誤差): 予測と実測の差の平均
+#
+# 【Train/Test分割】
+# データを訓練用(80%)とテスト用(20%)に分け、
+# 訓練データで学習し、未知のテストデータで性能を評価します。
+# テストデータでの性能が本当の予測能力を示します。
 
 def create_parity_plot(y_true_train, y_pred_train, y_true_test, y_pred_test,
                        y_std_train=None, y_std_test=None,
                        output_path=None, iteration=None):
     """
     パリティプロット（予測値 vs 実測値）を作成して保存
-    TrainデータとTestデータを異なる色で表示
+
+    【パリティプロットとは？】
+    X軸に実測値、Y軸に予測値をプロットしたグラフ。
+    理想的には全点が対角線（y=x）上に乗る。
+    対角線から離れているほど予測精度が悪い。
+
+    【プロットの見方】
+    - 青い点: 訓練データ（モデルが学習に使ったデータ）
+    - 赤い四角: テストデータ（モデルが見ていない未知のデータ）
+    - 点線: 理想線（y=x、完璧な予測）
+    - テストデータ（赤）が対角線近くにあれば、未知データへの予測も良好
     """
     y_true_train = np.array(y_true_train)
     y_pred_train = np.array(y_pred_train)
@@ -677,7 +817,7 @@ def compare_models(sequences, affinities, config, output_dir):
     # 外れ値を除外
     sequences_filtered, affinities_filtered, n_removed = filter_outliers(sequences, affinities)
     if n_removed > 0:
-        print(f'\nFiltered {n_removed} outliers (affinity >= {AFFINITY_OUTLIER_THRESHOLD})')
+        print(f'\nFiltered {n_removed} outliers (affinity >= {AFFINITY_OUTLIER_THRESHOLD_HIGH} or <= {AFFINITY_OUTLIER_THRESHOLD_LOW})')
         print(f'Using {len(sequences_filtered)} samples for model comparison')
 
     # Train/Test分割
@@ -949,9 +1089,40 @@ def create_surrogate_model(model_type, config):
 # =============================================================================
 # メインパイプライン
 # =============================================================================
+# Active Learning（能動学習）の本体。
+# 少ないデータで効率的に最適な配列を見つけるための反復的な最適化を行います。
+#
+# 【Active Learningの仕組み】
+# 1. 現在のデータでモデルを学習
+# 2. モデルで全候補の結合力を予測
+# 3. 「有望そう」かつ「不確実性が高い」候補を選択（獲得関数）
+# 4. 選択した候補をドッキング計算で評価
+# 5. 結果をデータに追加して1に戻る
+#
+# 【なぜActive Learningが有効？】
+# - ドッキング計算は1配列あたり数分〜数十分かかる
+# - 全配列を計算するのは非現実的（13アミノ酸なら20^13 = 約10^17通り）
+# - 賢く選んだ少数の配列だけを計算し、効率的に最適解に近づく
 
 class ActiveLearningFromLead:
-    """リード配列からActive Learningを開始するパイプライン"""
+    """
+    リード配列からActive Learningを開始するパイプライン
+
+    【このクラスの役割】
+    1. リード配列から変異体ライブラリを生成
+    2. 初期データを収集（ドッキング計算）
+    3. モデルを学習・選択
+    4. Active Learningループで最適化
+    5. 結果を保存・可視化
+
+    【使用例】
+    pipeline = ActiveLearningFromLead(
+        lead_sequence="htihswqmhfkin",
+        receptor_file="1O6K.trg",
+        ...
+    )
+    pipeline.run()
+    """
 
     def __init__(
         self,
@@ -1039,19 +1210,23 @@ class ActiveLearningFromLead:
     def _count_usable_samples(self):
         """外れ値を除いた有効なサンプル数をカウント"""
         affinities = np.array(list(self.all_results.values()))
-        n_usable = np.sum(affinities < AFFINITY_OUTLIER_THRESHOLD)
+        # 範囲内のデータのみカウント: -100 < affinity < 100
+        n_usable = np.sum((affinities > AFFINITY_OUTLIER_THRESHOLD_LOW) &
+                          (affinities < AFFINITY_OUTLIER_THRESHOLD_HIGH))
         return int(n_usable)
 
     def _print_data_status(self):
         """現在のデータ状況を表示"""
         affinities = np.array(list(self.all_results.values()))
         n_total = len(affinities)
-        n_outliers = np.sum(affinities >= AFFINITY_OUTLIER_THRESHOLD)
+        n_outliers_high = np.sum(affinities >= AFFINITY_OUTLIER_THRESHOLD_HIGH)
+        n_outliers_low = np.sum(affinities <= AFFINITY_OUTLIER_THRESHOLD_LOW)
+        n_outliers = n_outliers_high + n_outliers_low
         n_usable = n_total - n_outliers
         n_good = np.sum(affinities < 0)
 
         print(f"  Total results: {n_total}")
-        print(f"  Outliers (>= {AFFINITY_OUTLIER_THRESHOLD}): {n_outliers}")
+        print(f"  Outliers (>= {AFFINITY_OUTLIER_THRESHOLD_HIGH} or <= {AFFINITY_OUTLIER_THRESHOLD_LOW}): {n_outliers}")
         print(f"  Usable for training: {n_usable}")
         print(f"  Good results (< 0): {n_good}")
 
@@ -1112,7 +1287,9 @@ class ActiveLearningFromLead:
                 if res["success"]:
                     self.all_results[res["sequence"]] = res["affinity"]
                     n_success += 1
-                    if res["affinity"] < AFFINITY_OUTLIER_THRESHOLD:
+                    # 外れ値でないかチェック（-100 < affinity < 100）
+                    aff = res["affinity"]
+                    if aff > AFFINITY_OUTLIER_THRESHOLD_LOW and aff < AFFINITY_OUTLIER_THRESHOLD_HIGH:
                         n_usable_new += 1
 
             total_docked += len(library)
@@ -1217,7 +1394,7 @@ class ActiveLearningFromLead:
 
             print(f"  Total data: {len(all_sequences)} sequences")
             if n_outliers > 0:
-                print(f"  Outliers removed: {n_outliers} (affinity >= {AFFINITY_OUTLIER_THRESHOLD})")
+                print(f"  Outliers removed: {n_outliers} (outside {AFFINITY_OUTLIER_THRESHOLD_LOW} ~ {AFFINITY_OUTLIER_THRESHOLD_HIGH})")
             print(f"  Training data: {len(sequences)} sequences")
             print(f"  Current best: {affinities[0]:.2f} kcal/mol ({sequences[0]})")
 
@@ -1415,10 +1592,10 @@ class ActiveLearningFromLead:
         sequences = list(self.all_results.keys())
         affinities = np.array([self.all_results[s] for s in sequences])
 
-        # 外れ値を除外（学習データとして不適切な高エネルギー値）
+        # 外れ値を除外（学習データとして不適切な値）
         sequences, affinities, n_outliers = filter_outliers(sequences, affinities)
         if n_outliers > 0:
-            print(f"Excluded {n_outliers} outliers (affinity >= {AFFINITY_OUTLIER_THRESHOLD} kcal/mol) from final parity plot")
+            print(f"Excluded {n_outliers} outliers (outside {AFFINITY_OUTLIER_THRESHOLD_LOW} ~ {AFFINITY_OUTLIER_THRESHOLD_HIGH} kcal/mol) from final parity plot")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1480,35 +1657,65 @@ class ActiveLearningFromLead:
         print(f"  Total sequences evaluated: {len(self.all_results)}")
         print(f"  Best: {sorted_results[0][0]} ({sorted_results[0][1]:.2f} kcal/mol)")
 
+        # リードの順位を先に計算
+        lead_rank = None
+        lead_affinity = None
+        for i, (seq, aff) in enumerate(sorted_results, 1):
+            if seq == self.lead_sequence:
+                lead_rank = i
+                lead_affinity = aff
+                break
+
         print(f"\n[Top 10 Sequences]")
-        print("-" * 55)
-        print(f"{'Rank':<6} {'Sequence':<25} {'Affinity (kcal/mol)':<20}")
-        print("-" * 55)
+        print("-" * 60)
+        print(f"{'Rank':<6} {'Sequence':<25} {'Affinity (kcal/mol)':<20} {'Note':<8}")
+        print("-" * 60)
 
         for i, (seq, aff) in enumerate(sorted_results[:10], 1):
-            print(f"{i:<6} {seq:<25} {aff:<20.2f}")
+            note = "<- LEAD" if seq == self.lead_sequence else ""
+            print(f"{i:<6} {seq:<25} {aff:<20.2f} {note}")
+
+        # リードがTop 10に入っていない場合、別途表示
+        if lead_rank and lead_rank > 10:
+            print("...")
+            print(f"{lead_rank:<6} {self.lead_sequence:<25} {lead_affinity:<20.2f} <- LEAD")
+        print("-" * 60)
+
+        # リードの順位を必ず表示
+        print(f"\n[Lead Sequence Rank]")
+        if lead_rank:
+            print(f"  {self.lead_sequence}: Rank {lead_rank} / {len(sorted_results)} ({lead_affinity:.2f} kcal/mol)")
+        else:
+            print(f"  {self.lead_sequence}: NOT FOUND in results")
 
         # CSVで保存
         csv_file = self.output_dir / f"results_from_lead_{timestamp}.csv"
 
         with open(csv_file, 'w') as f:
-            f.write("rank,sequence,affinity\n")
+            f.write("rank,sequence,affinity,is_lead\n")
             for i, (seq, aff) in enumerate(sorted_results, 1):
-                f.write(f"{i},{seq},{aff}\n")
+                is_lead = "TRUE" if seq == self.lead_sequence else "FALSE"
+                f.write(f"{i},{seq},{aff},{is_lead}\n")
 
         print(f"\nResults saved to: {csv_file}")
 
-        # JSON保存
+        # リード情報（既に計算済み）
+        best_affinity = sorted_results[0][1]
+        improvement = (lead_affinity - best_affinity) if lead_affinity else 0
+
+        # JSON保存（リード情報を含む）
         json_file = self.output_dir / f"final_results_{timestamp}.json"
         final_data = {
             "lead_sequence": self.lead_sequence,
+            "lead_rank": lead_rank,
+            "lead_affinity": lead_affinity,
             "n_init": self.n_init,
             "n_iterations": self.n_iterations,
             "batch_size": self.batch_size,
             "total_evaluated": len(self.all_results),
             "best_sequence": sorted_results[0][0],
             "best_affinity": sorted_results[0][1],
-            "improvement": self.all_results.get(self.lead_sequence, 0) - sorted_results[0][1],
+            "improvement": improvement,
             "top_10": [{"sequence": s, "affinity": a} for s, a in sorted_results[:10]],
             "model_type": getattr(self, 'selected_model_type', 'GIN')
         }
@@ -1518,19 +1725,21 @@ class ActiveLearningFromLead:
 
         print(f"Final data saved to: {json_file}")
 
-        # リードとの比較
-        if self.lead_sequence in self.all_results:
-            lead_affinity = self.all_results[self.lead_sequence]
-            best_affinity = sorted_results[0][1]
-            improvement = lead_affinity - best_affinity
-
-            print(f"\n[Improvement Summary]")
-            print(f"  Lead sequence ({self.lead_sequence}): {lead_affinity:.2f} kcal/mol")
+        # リードとの比較（Improvement Summary）
+        print(f"\n[Improvement Summary]")
+        if lead_rank:
+            print(f"  Lead sequence ({self.lead_sequence}):")
+            print(f"    Affinity: {lead_affinity:.2f} kcal/mol")
+            print(f"    Rank: {lead_rank} / {len(sorted_results)}")
             print(f"  Best sequence ({sorted_results[0][0]}): {best_affinity:.2f} kcal/mol")
             if improvement > 0:
                 print(f"  Improvement: {improvement:.2f} kcal/mol ✓")
+            elif improvement == 0:
+                print(f"  Lead sequence is the best!")
             else:
                 print(f"  No improvement from lead sequence")
+        else:
+            print(f"  [Warning] Lead sequence ({self.lead_sequence}) not found in results")
 
         # 進捗プロット作成
         if hasattr(self, 'iteration_history') and self.iteration_history:
@@ -1631,30 +1840,30 @@ Examples:
         help="Disable OpenMM rescoring"
     )
 
-    # Paths
+    # Paths (相対パス: Research_Linux/ 以下)
     parser.add_argument(
         "--receptor",
-        default=str(RESEARCH_DIR / "docking_setup" / "1O6K.trg"),
+        default=str(RESEARCH_LINUX_DIR / "docking_setup" / "1O6K.trg"),
         help="Receptor target file (.trg)"
     )
     parser.add_argument(
         "--output-dir",
-        default=str(RESEARCH_DIR / "al_output"),
+        default=str(RESEARCH_LINUX_DIR / "al_output"),
         help="Output directory for CSV/JSON results"
     )
     parser.add_argument(
         "--result-dir",
-        default=str(RESEARCH_DIR / "result"),
+        default=str(RESEARCH_LINUX_DIR / "result"),
         help="Directory for initial docking results"
     )
     parser.add_argument(
         "--al-result-dir",
-        default=str(RESEARCH_DIR / "result_active_learning"),
+        default=str(RESEARCH_LINUX_DIR / "result_active_learning"),
         help="Directory for Active Learning docking results"
     )
     parser.add_argument(
         "--existing-dir",
-        default=str(RESEARCH_DIR / "result"),
+        default=str(RESEARCH_LINUX_DIR / "result"),
         help="Directory with existing docking results to scan"
     )
 
@@ -1747,13 +1956,15 @@ def interactive_setup(args) -> dict:
 
         # 統計情報
         n_good = sum(1 for a in affinities if a < 0)
-        n_outliers = sum(1 for a in affinities if a >= AFFINITY_OUTLIER_THRESHOLD)
+        n_outliers_high = sum(1 for a in affinities if a >= AFFINITY_OUTLIER_THRESHOLD_HIGH)
+        n_outliers_low = sum(1 for a in affinities if a <= AFFINITY_OUTLIER_THRESHOLD_LOW)
+        n_outliers = n_outliers_high + n_outliers_low
         n_usable = n_existing - n_outliers
 
         print()
         print(f"  [Combined Statistics]")
         print(f"    Total results: {n_existing}")
-        print(f"    Outliers (>= {AFFINITY_OUTLIER_THRESHOLD} kcal/mol): {n_outliers}")
+        print(f"    Outliers (>= {AFFINITY_OUTLIER_THRESHOLD_HIGH} or <= {AFFINITY_OUTLIER_THRESHOLD_LOW}): {n_outliers}")
         print(f"    Usable for training: {n_usable}")
         print(f"    Good results (affinity < 0): {n_good}")
         print(f"    Best: {best_seq} ({best_aff:.2f} kcal/mol)")
@@ -1777,7 +1988,7 @@ def interactive_setup(args) -> dict:
     # Step 2: データ収集の説明
     print("[Step 2] Data Collection Strategy")
     print()
-    print(f"  Target: {min_target} usable samples (affinity < {AFFINITY_OUTLIER_THRESHOLD} kcal/mol)")
+    print(f"  Target: {min_target} usable samples ({AFFINITY_OUTLIER_THRESHOLD_LOW} < affinity < {AFFINITY_OUTLIER_THRESHOLD_HIGH} kcal/mol)")
     print(f"  Current: {n_usable} usable samples")
 
     if n_usable >= min_target:
@@ -1858,7 +2069,7 @@ def main():
     if not Path(args.receptor).exists():
         print(f"ERROR: Receptor file not found: {args.receptor}")
         print("Create it with:")
-        print("  cd Research_Linux/Research/docking_setup")
+        print("  cd Research_Linux/docking_setup")
         print("  micromamba run -n adcpsuite agfr -r ../Input/1O6K_noligand.pdb --toPdbqt")
         print("  micromamba run -n adcpsuite agfr -r 1O6K_noligand_rec.pdbqt -l ../Input/Peptideligand.pdbqt -asv 1.1 -o 1O6K")
         return
